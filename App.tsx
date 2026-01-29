@@ -1,31 +1,29 @@
 /**
- * Minimal Reproduction: Skia Frame Ordering Bug
+ * Optimized Skia Atlas Demo
  *
- * Issue: https://github.com/Shopify/react-native-skia/issues/3426
+ * This version uses the Atlas API for high-performance rendering:
+ * - Single draw call for all tiles using Atlas
+ * - All transforms computed on the UI thread (worklet)
+ * - No JS re-renders during animation
  *
- * Problem: When finger is released and animation continues with withTiming/withDecay,
- * frames render out of order causing visual "jumps" or "rewinds".
- *
- * How to reproduce:
- * 1. Touch and drag the grid - motion is perfectly smooth
- * 2. Release finger with some velocity (flick gesture)
- * 3. Watch the momentum animation - frames appear to render out of order
- *    (e.g., instead of 1,2,3,4,5,6,7 you see 1,2,3,4,1,6,7)
- *
- * Key observation: Motion is smooth while finger is touching.
- * Stuttering/frame-rewind only happens after finger is released.
+ * Original issue: https://github.com/Shopify/react-native-skia/issues/3426
  */
 
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useMemo } from 'react';
 import { View, StyleSheet, Dimensions, Text } from 'react-native';
-import { Canvas, Group, Image, useImage } from '@shopify/react-native-skia';
+import {
+  Canvas,
+  Atlas,
+  useImage,
+  rect,
+  useRSXformBuffer,
+  SkRect,
+} from '@shopify/react-native-skia';
 import { Gesture, GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
 import {
   useSharedValue,
-  useDerivedValue,
   withTiming,
   Easing,
-  runOnJS,
   cancelAnimation,
 } from 'react-native-reanimated';
 
@@ -41,12 +39,16 @@ const GRID_SIZE = 50; // 50x50 grid of hex tiles
 const MAP_WIDTH = GRID_SIZE * HEX_HORIZONTAL_SPACING + HEX_TILE_WIDTH;
 const MAP_HEIGHT = GRID_SIZE * HEX_VERTICAL_SPACING + HEX_TILE_HEIGHT;
 
-// Biome types
-type Biome = 'plains' | 'desert' | 'dead';
+// Biome types - indices match the vertical position in atlas
+const BIOME_PLAINS = 0;
+const BIOME_DESERT = 1;
+const BIOME_DEAD = 2;
+
+type TileData = { x: number; y: number; biome: number };
 
 // Generate hex grid with biome zones
-function generateTiles(): { x: number; y: number; biome: Biome }[] {
-  const result: { x: number; y: number; biome: Biome }[] = [];
+function generateTiles(): TileData[] {
+  const result: TileData[] = [];
 
   for (let row = 0; row < GRID_SIZE; row++) {
     for (let col = 0; col < GRID_SIZE; col++) {
@@ -57,17 +59,17 @@ function generateTiles(): { x: number; y: number; biome: Biome }[] {
       const y = Math.round(row * HEX_VERTICAL_SPACING);
 
       // Assign biome based on position (creates distinct zones)
-      let biome: Biome;
+      let biome: number;
       const distFromCenter = Math.sqrt(
         Math.pow(col - GRID_SIZE / 2, 2) + Math.pow(row - GRID_SIZE / 2, 2)
       );
 
       if (distFromCenter < GRID_SIZE / 4) {
-        biome = 'dead';      // Center is dead/volcanic
+        biome = BIOME_DEAD;      // Center is dead/volcanic
       } else if (distFromCenter < GRID_SIZE / 2) {
-        biome = 'desert';    // Middle ring is desert
+        biome = BIOME_DESERT;    // Middle ring is desert
       } else {
-        biome = 'plains';    // Outer area is plains
+        biome = BIOME_PLAINS;    // Outer area is plains
       }
 
       result.push({ x, y, biome });
@@ -78,25 +80,27 @@ function generateTiles(): { x: number; y: number; biome: Biome }[] {
 }
 
 export default function App() {
-  const [updateCount, setUpdateCount] = useState(0);
-  const [tick, setTick] = useState(0);
+  // Load the atlas image (all 3 biomes stacked vertically: plains, desert, dead)
+  const atlasImage = useImage(require('./assets/atlas.png'));
 
-  // Simulate march progress updates - this is what makes the bug visible!
-  // The real app has a 250ms interval updating march progress during scroll
-  React.useEffect(() => {
-    const interval = setInterval(() => {
-      setTick(t => t + 1);
-    }, 250); // Match the real app's MarchRenderer interval
-    return () => clearInterval(interval);
-  }, []);
-
-  // Load tile images
-  const plainsImage = useImage(require('./assets/plains.png'));
-  const desertImage = useImage(require('./assets/desert.png'));
-  const deadImage = useImage(require('./assets/dead.png'));
-
-  // Generate tiles once
+  // Generate tiles once - this is static data
   const tiles = useMemo(() => generateTiles(), []);
+  const tileCount = tiles.length;
+
+  // Pre-compute sprite rectangles for each tile based on biome
+  // Each sprite references a region in the atlas image
+  const sprites = useMemo((): SkRect[] => {
+    return tiles.map((tile) => {
+      // Each biome is stacked vertically in the atlas
+      const srcY = tile.biome * HEX_TILE_HEIGHT;
+      return rect(0, srcY, HEX_TILE_WIDTH, HEX_TILE_HEIGHT);
+    });
+  }, [tiles]);
+
+  // Pre-compute base positions for each tile (static, won't change)
+  const tilePositions = useMemo(() => {
+    return tiles.map((tile) => ({ x: tile.x, y: tile.y }));
+  }, [tiles]);
 
   // Shared values for scroll position
   const scrollX = useSharedValue(MAP_WIDTH / 2 - SCREEN_WIDTH / 2);
@@ -106,11 +110,17 @@ export default function App() {
   const startScrollX = useSharedValue(0);
   const startScrollY = useSharedValue(0);
 
-  // Transform for the Group - derived from scroll values
-  const transform = useDerivedValue(() => [
-    { translateX: -scrollX.value },
-    { translateY: -scrollY.value },
-  ]);
+  // RSXform buffer - transforms computed entirely on UI thread
+  // This is the key optimization: no JS re-renders needed!
+  const transforms = useRSXformBuffer(tileCount, (val, i) => {
+    'worklet';
+    const pos = tilePositions[i];
+    // RSXform: set(cos(rotation), sin(rotation), tx, ty)
+    // For no rotation, cos(0)=1, sin(0)=0
+    const tx = pos.x - scrollX.value;
+    const ty = pos.y - scrollY.value;
+    val.set(1, 0, tx, ty);
+  });
 
   // Clamp scroll to valid bounds
   const clampScroll = (x: number, y: number) => {
@@ -123,30 +133,25 @@ export default function App() {
     };
   };
 
-  // Trigger a small state update (makes the bug more visible)
-  const triggerStateUpdate = useCallback(() => {
-    setUpdateCount(c => c + 1);
-  }, []);
-
-  // Pan gesture with momentum
+  // Pan gesture with momentum - runs entirely on UI thread
   const panGesture = Gesture.Pan()
     .onStart(() => {
+      'worklet';
       cancelAnimation(scrollX);
       cancelAnimation(scrollY);
       startScrollX.value = scrollX.value;
       startScrollY.value = scrollY.value;
     })
     .onUpdate((event) => {
+      'worklet';
       const newX = startScrollX.value - event.translationX;
       const newY = startScrollY.value - event.translationY;
       const clamped = clampScroll(newX, newY);
       scrollX.value = clamped.x;
       scrollY.value = clamped.y;
-
-      // Trigger state updates during drag (makes bug more visible)
-      runOnJS(triggerStateUpdate)();
     })
     .onEnd((event) => {
+      'worklet';
       cancelAnimation(scrollX);
       cancelAnimation(scrollY);
 
@@ -167,7 +172,7 @@ export default function App() {
       const distance = Math.sqrt(momentumX * momentumX + momentumY * momentumY);
       const duration = Math.min(1200, Math.max(400, distance * 0.8));
 
-      // withTiming momentum (issue still occurs)
+      // withTiming momentum - all on UI thread
       scrollX.value = withTiming(targetX, {
         duration,
         easing: Easing.out(Easing.cubic),
@@ -179,20 +184,11 @@ export default function App() {
       });
     });
 
-  // Get image for biome
-  const getImageForBiome = (biome: Biome) => {
-    switch (biome) {
-      case 'plains': return plainsImage;
-      case 'desert': return desertImage;
-      case 'dead': return deadImage;
-    }
-  };
-
   // Loading state
-  if (!plainsImage || !desertImage || !deadImage) {
+  if (!atlasImage) {
     return (
       <View style={styles.loading}>
-        <Text style={styles.loadingText}>Loading tiles...</Text>
+        <Text style={styles.loadingText}>Loading atlas...</Text>
       </View>
     );
   }
@@ -202,35 +198,24 @@ export default function App() {
       <GestureDetector gesture={panGesture}>
         <View style={styles.canvasContainer}>
           <Canvas style={styles.canvas}>
-            <Group transform={transform}>
-              {/* Render hex grid of terrain tiles */}
-              {tiles.map((tile, index) => {
-                const image = getImageForBiome(tile.biome);
-                if (!image) return null;
-                return (
-                  <Image
-                    key={index}
-                    image={image}
-                    x={tile.x}
-                    y={tile.y}
-                    width={HEX_TILE_WIDTH}
-                    height={HEX_TILE_HEIGHT}
-                  />
-                );
-              })}
-            </Group>
+            {/* Single Atlas draw call for all 2500 tiles */}
+            <Atlas
+              image={atlasImage}
+              sprites={sprites}
+              transforms={transforms}
+            />
           </Canvas>
 
           {/* Debug info */}
           <View style={styles.debugOverlay}>
             <Text style={styles.debugText}>
-              Drag updates: {updateCount} | Tick: {tick}
+              Atlas mode: {tileCount} tiles in 1 draw call
             </Text>
             <Text style={styles.debugText}>
-              Flick to scroll - watch for stuttering after release
+              All transforms computed on UI thread (worklet)
             </Text>
             <Text style={styles.debugHint}>
-              State updates every 250ms (like march progress)
+              No JS re-renders during animation
             </Text>
           </View>
         </View>
