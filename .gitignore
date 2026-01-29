@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+
+# Native builds
+ios/
+android/
+
+# Misc
+.DS_Store
+*.log
+npm-debug.log*
+
+# TypeScript
+*.tsbuildinfo

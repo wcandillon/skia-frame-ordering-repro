@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "skia-frame-ordering-repro",
+    "slug": "skia-frame-ordering-repro",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "skia-repro",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.example.skiarepro"
+    },
+    "android": {
+      "package": "com.example.skiarepro"
+    }
+  }
+}
