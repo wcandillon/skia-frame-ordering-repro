@@ -72,5 +72,3 @@ The cross-thread timing conflict causes frames to render out of order.
 ## Notes from Investigation
 
 The issue started appearing in **Skia versions after 1.9.0**. On 1.9.0 everything is smooth.
-
-In our production app with more data (hex tiles, sprites, labels), the issue becomes severe - massive stuttering and frame skipping. On 1.9.0, everything is perfectly smooth even on low-end devices.
